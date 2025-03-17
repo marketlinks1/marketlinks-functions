@@ -266,11 +266,22 @@ function extractEssentialBalanceSheet(balanceSheet) {
 function extractPriceHistory(priceData) {
   if (!priceData || !priceData.historical) return [];
   
-  return priceData.historical.map(day => ({
+  // Add 52-week high and low to the data set for target price calculations
+  const closePrices = priceData.historical.map(day => day.close);
+  const high52Week = Math.max(...closePrices);
+  const low52Week = Math.min(...closePrices);
+  
+  const result = priceData.historical.map(day => ({
     date: day.date,
     close: day.close,
     volume: day.volume
   }));
+  
+  // Add 52-week high and low as properties
+  result.high52Week = high52Week;
+  result.low52Week = low52Week;
+  
+  return result;
 }
 
 // Calculate technical indicators locally instead of fetching them
@@ -278,14 +289,27 @@ function calculateTechnicals(priceHistory) {
   if (!priceHistory || priceHistory.length < 14) return null;
   
   const closePrices = priceHistory.map(day => day.close);
+  const currentPrice = closePrices[closePrices.length - 1];
+  const high52Week = priceHistory.high52Week || Math.max(...closePrices);
+  const low52Week = priceHistory.low52Week || Math.min(...closePrices);
+  
+  // Calculate distance from 52-week high and low as percentage
+  const distanceFromHigh = ((high52Week - currentPrice) / high52Week) * 100;
+  const distanceFromLow = ((currentPrice - low52Week) / low52Week) * 100;
   
   return {
     rsi: technicalIndicators.calculateRSI(closePrices),
     sma20: technicalIndicators.calculateMA(closePrices, 20),
     sma50: technicalIndicators.calculateMA(closePrices, 50),
+    sma200: technicalIndicators.calculateMA(closePrices, Math.min(200, closePrices.length)),
     priceChange1m: calculatePercentChange(closePrices, 20),
     priceChange3m: calculatePercentChange(closePrices, 60),
-    volumeChange: calculateVolumeChange(priceHistory)
+    volumeChange: calculateVolumeChange(priceHistory),
+    high52Week,
+    low52Week,
+    distanceFromHigh,
+    distanceFromLow,
+    currentPrice
   };
 }
 
@@ -311,6 +335,7 @@ function calculateVolumeChange(priceHistory) {
 async function getAIPrediction(data, symbol) {
   // Prepare a compact prompt with only essential data
   const compactPrompt = createCompactPrompt(data, symbol);
+  const currentPrice = data.priceHistory?.[data.priceHistory.length - 1]?.close || 0;
   
   try {
     // Check if we can reuse a cached model response
@@ -340,10 +365,19 @@ async function getAIPrediction(data, symbol) {
     const result = await response.json();
     const prediction = JSON.parse(result.choices[0].message.content);
     
-    // Cache the AI prediction
-    memoryCache.set(cacheKey, prediction, 43200); // 12 hour cache
+    // Ensure all fields are present and formatted correctly
+    const formattedPrediction = {
+      recommendation: prediction.recommendation,
+      reason: prediction.reason,
+      targetPrice: parseFloat(prediction.targetPrice) || currentPrice,
+      upside: parseFloat(prediction.upside) || ((prediction.targetPrice / currentPrice - 1) * 100).toFixed(1),
+      confidence: parseInt(prediction.confidence) || 50
+    };
     
-    return prediction;
+    // Cache the AI prediction
+    memoryCache.set(cacheKey, formattedPrediction, 43200); // 12 hour cache
+    
+    return formattedPrediction;
   } catch (err) {
     console.error('Error getting AI prediction:', err);
     
@@ -355,6 +389,7 @@ async function getAIPrediction(data, symbol) {
 // Create a compact prompt for the AI with only essential data
 function createCompactPrompt(data, symbol) {
   const { fundamentals, balanceSheet, technicalAnalysis } = data;
+  const currentPrice = data.priceHistory?.[data.priceHistory.length - 1]?.close || 0;
   
   return `
 You are an AI financial analyst. Based on the following data for ${symbol}, provide a recommendation: BUY, SELL, or HOLD.
@@ -379,10 +414,14 @@ Technical Indicators:
 - 3-Month Price Change: ${technicalAnalysis?.priceChange3m}%
 - Volume Change: ${technicalAnalysis?.volumeChange}%
 
+Current Price: ${currentPrice.toFixed(2)}
+
 Respond with only a JSON object containing:
 {
   "recommendation": "BUY/SELL/HOLD",
   "reason": "Brief explanation of your recommendation (1-2 sentences)",
+  "targetPrice": numerical value representing your 12-month price target,
+  "upside": percentage representing potential upside or downside from current price,
   "confidence": 0-100
 }
   `;
@@ -397,34 +436,51 @@ function getDataFingerprint(data) {
 // Generate fallback recommendation if AI fails
 function generateFallbackRecommendation(data) {
   const { technicalAnalysis } = data;
+  const currentPrice = data.priceHistory?.[data.priceHistory.length - 1]?.close || 0;
   
   if (!technicalAnalysis) {
     return {
       recommendation: "HOLD",
       reason: "Insufficient data to make a confident recommendation.",
+      targetPrice: currentPrice,
+      upside: 0,
       confidence: 30
     };
   }
   
-  const { rsi, priceChange1m, priceChange3m } = technicalAnalysis;
+  const { rsi, priceChange1m, priceChange3m, sma50 } = technicalAnalysis;
+  let targetPrice = currentPrice;
   
-  // Basic algorithm for fallback recommendation
+  // Basic algorithm for fallback recommendation with target price
   if (rsi < 30 && priceChange1m < -5 && priceChange3m < 0) {
+    // For oversold stocks, estimate a 15% recovery
+    targetPrice = currentPrice * 1.15;
     return {
       recommendation: "BUY",
       reason: "Stock appears oversold with low RSI and recent price decline.",
+      targetPrice: parseFloat(targetPrice.toFixed(2)),
+      upside: 15,
       confidence: 60
     };
   } else if (rsi > 70 && priceChange1m > 10) {
+    // For overbought stocks, estimate a 10% correction
+    targetPrice = currentPrice * 0.9;
     return {
       recommendation: "SELL",
       reason: "Stock appears overbought with high RSI and recent sharp price increase.",
+      targetPrice: parseFloat(targetPrice.toFixed(2)),
+      upside: -10,
       confidence: 60
     };
   } else {
+    // For neutral stocks, use SMA50 as reference or estimate modest 5% growth
+    targetPrice = sma50 || currentPrice * 1.05;
+    const upside = ((targetPrice / currentPrice) - 1) * 100;
     return {
       recommendation: "HOLD",
       reason: "Technical indicators show neutral signals.",
+      targetPrice: parseFloat(targetPrice.toFixed(2)),
+      upside: parseFloat(upside.toFixed(1)),
       confidence: 50
     };
   }
