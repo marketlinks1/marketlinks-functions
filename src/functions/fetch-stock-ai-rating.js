@@ -414,14 +414,6 @@ function calculatePercentChange(prices, days) {
   return ((recent - past) / past) * 100;
 }
 
-// Calculate percentage price change
-function calculatePercentChange(prices, days) {
-  if (prices.length < days) return null;
-  const recent = prices[prices.length - 1];
-  const past = prices[prices.length - 1 - days];
-  return ((recent - past) / past) * 100;
-}
-
 // Calculate volume change (adjusted for array order - newest first)
 function calculateVolumeChange(priceHistory) {
   if (priceHistory.length < 20) return null;
@@ -431,6 +423,17 @@ function calculateVolumeChange(priceHistory) {
   const pastVolume = priceHistory.slice(10, 20).reduce((sum, day) => sum + day.volume, 0) / 10;
   
   return ((recentVolume - pastVolume) / pastVolume) * 100;
+}
+
+// Generate a fingerprint of the data for caching purposes
+function getDataFingerprint(data) {
+  const { fundamentals, technicalAnalysis } = data;
+  
+  if (!fundamentals || !technicalAnalysis) {
+    return Date.now().toString(); // Fallback to current timestamp if data is missing
+  }
+  
+  return `${fundamentals.date || ''}_${(technicalAnalysis.rsi || 0).toFixed(1)}_${(technicalAnalysis.priceChange1m || 0).toFixed(1)}`;
 }
 
 // Use a streamlined approach for AI prediction with essential data only
@@ -452,7 +455,7 @@ async function getAIPrediction(data, symbol) {
     const cachedPrediction = memoryCache.get(cacheKey);
     if (cachedPrediction) return cachedPrediction;
     
-    console.log(`Requesting fresh AI prediction for ${symbol} at ${currentPrice.toFixed(2)}`);
+    console.log(`Requesting fresh AI prediction for ${symbol} at $${currentPrice.toFixed(2)}`);
     
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -513,9 +516,10 @@ function createCompactPrompt(data, symbol) {
   const currentPrice = technicalAnalysis?.currentPrice || 0;
   
   // Format key ratios and metrics
-  const pe = currentQuote?.price && fundamentals?.eps 
-    ? (currentQuote.price / fundamentals.eps).toFixed(2) 
-    : 'N/A';
+  let pe = 'N/A';
+  if (currentQuote?.price && fundamentals?.eps && fundamentals.eps !== 0) {
+    pe = (currentQuote.price / fundamentals.eps).toFixed(2);
+  }
   
   return `
 You are an AI financial analyst. Based on the following real-time data for ${symbol}, provide a recommendation: BUY, SELL, or HOLD.
@@ -547,7 +551,7 @@ Technical Indicators:
 - % From 52-Week High: ${formatPercentage(technicalAnalysis?.distanceFromHigh)}
 - % From 52-Week Low: ${formatPercentage(technicalAnalysis?.distanceFromLow)}
 
-Current Price: ${formatNumber(currentPrice, 2)}
+Current Price: $${formatNumber(currentPrice, 2)}
 Last Updated: ${new Date().toISOString()}
 
 Respond with only a JSON object containing:
@@ -574,63 +578,63 @@ function formatPercentage(percent) {
   if (percent === undefined || percent === null) return 'N/A';
   return percent.toFixed(2) + '%';
 }
-}
-
-// Generate a fingerprint of the data for caching purposes
-function getDataFingerprint(data) {
-  const { fundamentals, technicalAnalysis } = data;
-  return `${fundamentals?.date}_${technicalAnalysis?.rsi?.toFixed(1)}_${technicalAnalysis?.priceChange1m?.toFixed(1)}`;
-}
 
 // Generate fallback recommendation if AI fails
 function generateFallbackRecommendation(data) {
   const { technicalAnalysis } = data;
-  const currentPrice = data.priceHistory?.[data.priceHistory.length - 1]?.close || 0;
+  const currentPrice = technicalAnalysis?.currentPrice || 0;
   
-  if (!technicalAnalysis) {
+  if (!technicalAnalysis || !currentPrice) {
     return {
       recommendation: "HOLD",
       reason: "Insufficient data to make a confident recommendation.",
-      targetPrice: currentPrice,
+      targetPrice: currentPrice || 0,
       upside: 0,
-      confidence: 30
+      confidence: 30,
+      analysisTime: new Date().toISOString()
     };
   }
   
   const { rsi, priceChange1m, priceChange3m, sma50 } = technicalAnalysis;
   let targetPrice = currentPrice;
+  let upside = 0;
   
   // Basic algorithm for fallback recommendation with target price
   if (rsi < 30 && priceChange1m < -5 && priceChange3m < 0) {
     // For oversold stocks, estimate a 15% recovery
     targetPrice = currentPrice * 1.15;
+    upside = 15;
     return {
       recommendation: "BUY",
       reason: "Stock appears oversold with low RSI and recent price decline.",
       targetPrice: parseFloat(targetPrice.toFixed(2)),
-      upside: 15,
-      confidence: 60
+      upside: upside,
+      confidence: 60,
+      analysisTime: new Date().toISOString()
     };
   } else if (rsi > 70 && priceChange1m > 10) {
     // For overbought stocks, estimate a 10% correction
     targetPrice = currentPrice * 0.9;
+    upside = -10;
     return {
       recommendation: "SELL",
       reason: "Stock appears overbought with high RSI and recent sharp price increase.",
       targetPrice: parseFloat(targetPrice.toFixed(2)),
-      upside: -10,
-      confidence: 60
+      upside: upside,
+      confidence: 60,
+      analysisTime: new Date().toISOString()
     };
   } else {
     // For neutral stocks, use SMA50 as reference or estimate modest 5% growth
     targetPrice = sma50 || currentPrice * 1.05;
-    const upside = ((targetPrice / currentPrice) - 1) * 100;
+    upside = ((targetPrice / currentPrice) - 1) * 100;
     return {
       recommendation: "HOLD",
       reason: "Technical indicators show neutral signals.",
       targetPrice: parseFloat(targetPrice.toFixed(2)),
       upside: parseFloat(upside.toFixed(1)),
-      confidence: 50
+      confidence: 50,
+      analysisTime: new Date().toISOString()
     };
   }
 }
