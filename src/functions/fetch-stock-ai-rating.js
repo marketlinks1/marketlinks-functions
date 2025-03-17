@@ -223,35 +223,63 @@ async function fetchOptimizedData(symbol) {
   
   // Check memory cache first
   const cachedData = memoryCache.get(cacheKey);
-  if (cachedData) return cachedData;
+  // Only use cached data if it's very fresh (5 minutes)
+  if (cachedData && Date.now() - cachedData._fetchTime < 5 * 60 * 1000) return cachedData;
 
   try {
-    // Make separate requests since FMP might not support batch requests on the free tier
+    // Make separate requests including a dedicated request for the latest real-time price
     const endpoints = [
       `https://financialmodelingprep.com/api/v3/income-statement/${symbol}?limit=1&apikey=${apiKey}`,
       `https://financialmodelingprep.com/api/v3/balance-sheet-statement/${symbol}?limit=1&apikey=${apiKey}`,
-      `https://financialmodelingprep.com/api/v3/historical-price-full/${symbol}?from=${getDateXMonthsAgo(12)}&apikey=${apiKey}`
+      `https://financialmodelingprep.com/api/v3/historical-price-full/${symbol}?from=${getDateXMonthsAgo(12)}&apikey=${apiKey}`,
+      `https://financialmodelingprep.com/api/v3/quote/${symbol}?apikey=${apiKey}` // Get latest real-time quote
     ];
     
-    const [incomeRes, balanceRes, priceRes] = await Promise.all(
+    const [incomeRes, balanceRes, priceHistoryRes, quoteRes] = await Promise.all(
       endpoints.map(url => fetch(url).then(res => res.json()))
     );
+    
+    // Extract current price from quote data
+    const currentQuote = Array.isArray(quoteRes) && quoteRes.length > 0 ? quoteRes[0] : null;
+    
+    // Create a modified price history that includes the latest real-time price
+    const priceHistory = extractPriceHistory(priceHistoryRes, currentQuote);
     
     // Extract and process relevant data only
     const result = {
       fundamentals: extractEssentialFinancials(incomeRes[0]),
       balanceSheet: extractEssentialBalanceSheet(balanceRes[0]),
-      priceHistory: extractPriceHistory(priceRes)
+      priceHistory: priceHistory,
+      currentQuote: extractEssentialQuoteData(currentQuote),
+      _fetchTime: Date.now() // Add timestamp to track when data was fetched
     };
     
-    // Cache the result
-    memoryCache.set(cacheKey, result, 1800); // 30 minute cache
+    // Cache the result for a shorter time to ensure price freshness
+    memoryCache.set(cacheKey, result, 300); // 5 minute cache for price data
     
     return result;
   } catch (error) {
     console.error('Error fetching data:', error.message);
     return null;
   }
+}
+
+// Extract essential data from the quote endpoint
+function extractEssentialQuoteData(quote) {
+  if (!quote) return null;
+  
+  return {
+    price: quote.price,
+    change: quote.change,
+    changesPercentage: quote.changesPercentage,
+    dayLow: quote.dayLow,
+    dayHigh: quote.dayHigh,
+    yearHigh: quote.yearHigh,
+    yearLow: quote.yearLow,
+    marketCap: quote.marketCap,
+    volume: quote.volume,
+    avgVolume: quote.avgVolume
+  };
 }
 
 // Get date X months ago in YYYY-MM-DD format
@@ -292,20 +320,49 @@ function extractEssentialBalanceSheet(balanceSheet) {
   };
 }
 
-// Extract price history
-function extractPriceHistory(priceData) {
+// Extract price history and ensure the most recent price is used
+function extractPriceHistory(priceData, currentQuote = null) {
   if (!priceData || !priceData.historical) return [];
   
-  // Add 52-week high and low to the data set for target price calculations
-  const closePrices = priceData.historical.map(day => day.close);
-  const high52Week = Math.max(...closePrices);
-  const low52Week = Math.min(...closePrices);
+  // Create a copy of the historical data
+  const historicalData = [...priceData.historical];
   
-  const result = priceData.historical.map(day => ({
+  // Sort historical data by date (newest first) to ensure correct ordering
+  historicalData.sort((a, b) => new Date(b.date) - new Date(a.date));
+  
+  // Create the result array with mapped data
+  const result = historicalData.map(day => ({
     date: day.date,
     close: day.close,
     volume: day.volume
   }));
+  
+  // If we have current quote data, check if we need to update the most recent price
+  if (currentQuote && currentQuote.price) {
+    const today = new Date().toISOString().split('T')[0];
+    const mostRecentDate = result.length > 0 ? result[0].date : null;
+    
+    // If most recent historical data is not from today, add the current quote as a new entry
+    if (mostRecentDate !== today) {
+      result.unshift({
+        date: today,
+        close: currentQuote.price,
+        volume: currentQuote.volume || (result.length > 0 ? result[0].volume : 0)
+      });
+    } 
+    // If it is from today but the price is different, update it
+    else if (Math.abs(result[0].close - currentQuote.price) > 0.01) {
+      result[0].close = currentQuote.price;
+      if (currentQuote.volume) result[0].volume = currentQuote.volume;
+    }
+  }
+  
+  // Add 52-week high and low data
+  const closePrices = result.map(day => day.close);
+  
+  // Use quote data for 52-week high/low if available, otherwise calculate from historical data
+  const high52Week = currentQuote?.yearHigh || Math.max(...closePrices);
+  const low52Week = currentQuote?.yearLow || Math.min(...closePrices);
   
   // Add 52-week high and low as properties
   result.high52Week = high52Week;
@@ -318,8 +375,9 @@ function extractPriceHistory(priceData) {
 function calculateTechnicals(priceHistory) {
   if (!priceHistory || priceHistory.length < 14) return null;
   
+  // Ensure we're working with the most recent price data (at index 0 after sorting)
   const closePrices = priceHistory.map(day => day.close);
-  const currentPrice = closePrices[closePrices.length - 1];
+  const currentPrice = closePrices[0]; // first element is most recent after sorting
   const high52Week = priceHistory.high52Week || Math.max(...closePrices);
   const low52Week = priceHistory.low52Week || Math.min(...closePrices);
   
@@ -327,20 +385,33 @@ function calculateTechnicals(priceHistory) {
   const distanceFromHigh = ((high52Week - currentPrice) / high52Week) * 100;
   const distanceFromLow = ((currentPrice - low52Week) / low52Week) * 100;
   
+  // Get the timestamp for the current price
+  const lastUpdated = new Date().toISOString();
+  
   return {
-    rsi: technicalIndicators.calculateRSI(closePrices),
+    rsi: technicalIndicators.calculateRSI(closePrices.slice().reverse()), // Reverse back to chronological for RSI
     sma20: technicalIndicators.calculateMA(closePrices, 20),
     sma50: technicalIndicators.calculateMA(closePrices, 50),
     sma200: technicalIndicators.calculateMA(closePrices, Math.min(200, closePrices.length)),
-    priceChange1m: calculatePercentChange(closePrices, 20),
-    priceChange3m: calculatePercentChange(closePrices, 60),
+    priceChange1d: calculatePercentChange(closePrices, 1),
+    priceChange1m: calculatePercentChange(closePrices, Math.min(20, closePrices.length - 1)),
+    priceChange3m: calculatePercentChange(closePrices, Math.min(60, closePrices.length - 1)),
     volumeChange: calculateVolumeChange(priceHistory),
     high52Week,
     low52Week,
     distanceFromHigh,
     distanceFromLow,
-    currentPrice
+    currentPrice,
+    lastUpdated
   };
+}
+
+// Calculate percentage price change - adjusted for reversed array (newest first)
+function calculatePercentChange(prices, days) {
+  if (prices.length < days + 1) return null;
+  const recent = prices[0]; // newest is at index 0
+  const past = prices[days]; // go back "days" elements
+  return ((recent - past) / past) * 100;
 }
 
 // Calculate percentage price change
@@ -351,27 +422,37 @@ function calculatePercentChange(prices, days) {
   return ((recent - past) / past) * 100;
 }
 
-// Calculate volume change
+// Calculate volume change (adjusted for array order - newest first)
 function calculateVolumeChange(priceHistory) {
   if (priceHistory.length < 20) return null;
   
-  const recentVolume = priceHistory.slice(-10).reduce((sum, day) => sum + day.volume, 0) / 10;
-  const pastVolume = priceHistory.slice(-20, -10).reduce((sum, day) => sum + day.volume, 0) / 10;
+  // After our sorting, most recent data is at the beginning of the array
+  const recentVolume = priceHistory.slice(0, 10).reduce((sum, day) => sum + day.volume, 0) / 10;
+  const pastVolume = priceHistory.slice(10, 20).reduce((sum, day) => sum + day.volume, 0) / 10;
   
   return ((recentVolume - pastVolume) / pastVolume) * 100;
 }
 
 // Use a streamlined approach for AI prediction with essential data only
 async function getAIPrediction(data, symbol) {
+  // Get the current price from technical analysis data
+  const currentPrice = data.technicalAnalysis?.currentPrice || 0;
+  
   // Prepare a compact prompt with only essential data
   const compactPrompt = createCompactPrompt(data, symbol);
-  const currentPrice = data.priceHistory?.[data.priceHistory.length - 1]?.close || 0;
   
   try {
+    // Creating a more unique fingerprint based on current price and time
+    // This ensures we get fresh predictions when prices change significantly
+    const dataFingerprint = getDataFingerprint(data);
+    const priceFingerprint = `${currentPrice.toFixed(2)}`;
+    const cacheKey = `ai_${symbol}_${dataFingerprint}_${priceFingerprint}`;
+    
     // Check if we can reuse a cached model response
-    const cacheKey = `ai_${symbol}_${getDataFingerprint(data)}`;
     const cachedPrediction = memoryCache.get(cacheKey);
     if (cachedPrediction) return cachedPrediction;
+    
+    console.log(`Requesting fresh AI prediction for ${symbol} at ${currentPrice.toFixed(2)}`);
     
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -393,7 +474,14 @@ async function getAIPrediction(data, symbol) {
     }
 
     const result = await response.json();
-    const prediction = JSON.parse(result.choices[0].message.content);
+    let prediction;
+    
+    try {
+      prediction = JSON.parse(result.choices[0].message.content);
+    } catch (err) {
+      console.error('Error parsing AI response:', err);
+      throw new Error('Failed to parse AI response');
+    }
     
     // Ensure all fields are present and formatted correctly
     const formattedPrediction = {
@@ -401,11 +489,12 @@ async function getAIPrediction(data, symbol) {
       reason: prediction.reason,
       targetPrice: parseFloat(prediction.targetPrice) || currentPrice,
       upside: parseFloat(prediction.upside) || ((prediction.targetPrice / currentPrice - 1) * 100).toFixed(1),
-      confidence: parseInt(prediction.confidence) || 50
+      confidence: parseInt(prediction.confidence) || 50,
+      analysisTime: new Date().toISOString()
     };
     
-    // Cache the AI prediction
-    memoryCache.set(cacheKey, formattedPrediction, 43200); // 12 hour cache
+    // Cache the AI prediction - reduced cache time to ensure freshness
+    memoryCache.set(cacheKey, formattedPrediction, 3600); // 1 hour cache
     
     return formattedPrediction;
   } catch (err) {
@@ -418,33 +507,48 @@ async function getAIPrediction(data, symbol) {
 
 // Create a compact prompt for the AI with only essential data
 function createCompactPrompt(data, symbol) {
-  const { fundamentals, balanceSheet, technicalAnalysis } = data;
-  const currentPrice = data.priceHistory?.[data.priceHistory.length - 1]?.close || 0;
+  const { fundamentals, balanceSheet, technicalAnalysis, currentQuote } = data;
+  
+  // Use technicalAnalysis.currentPrice which is most up-to-date
+  const currentPrice = technicalAnalysis?.currentPrice || 0;
+  
+  // Format key ratios and metrics
+  const pe = currentQuote?.price && fundamentals?.eps 
+    ? (currentQuote.price / fundamentals.eps).toFixed(2) 
+    : 'N/A';
   
   return `
-You are an AI financial analyst. Based on the following data for ${symbol}, provide a recommendation: BUY, SELL, or HOLD.
+You are an AI financial analyst. Based on the following real-time data for ${symbol}, provide a recommendation: BUY, SELL, or HOLD.
 
 Key Fundamentals:
-- Revenue: ${fundamentals?.revenue}
-- Net Income: ${fundamentals?.netIncome}
+- Revenue: ${formatNumber(fundamentals?.revenue)}
+- Net Income: ${formatNumber(fundamentals?.netIncome)}
 - EPS: ${fundamentals?.eps}
-- Net Income Ratio: ${fundamentals?.netIncomeRatio}
+- Net Income Ratio: ${formatPercentage(fundamentals?.netIncomeRatio)}
+- P/E Ratio: ${pe}
 
 Balance Sheet:
-- Total Assets: ${balanceSheet?.totalAssets}
-- Total Liabilities: ${balanceSheet?.totalLiabilities}
-- Debt to Assets: ${balanceSheet?.debtToAssets}
-- Current Ratio: ${balanceSheet?.currentRatio}
+- Total Assets: ${formatNumber(balanceSheet?.totalAssets)}
+- Total Liabilities: ${formatNumber(balanceSheet?.totalLiabilities)}
+- Debt to Assets: ${formatPercentage(balanceSheet?.debtToAssets * 100)}
+- Current Ratio: ${balanceSheet?.currentRatio?.toFixed(2) || 'N/A'}
 
 Technical Indicators:
-- RSI (14-day): ${technicalAnalysis?.rsi}
-- SMA20: ${technicalAnalysis?.sma20}
-- SMA50: ${technicalAnalysis?.sma50}
-- 1-Month Price Change: ${technicalAnalysis?.priceChange1m}%
-- 3-Month Price Change: ${technicalAnalysis?.priceChange3m}%
-- Volume Change: ${technicalAnalysis?.volumeChange}%
+- RSI (14-day): ${formatNumber(technicalAnalysis?.rsi, 2)}
+- SMA20: ${formatNumber(technicalAnalysis?.sma20, 2)}
+- SMA50: ${formatNumber(technicalAnalysis?.sma50, 2)}
+- SMA200: ${formatNumber(technicalAnalysis?.sma200, 2)}
+- 1-Day Price Change: ${formatPercentage(technicalAnalysis?.priceChange1d)}
+- 1-Month Price Change: ${formatPercentage(technicalAnalysis?.priceChange1m)}
+- 3-Month Price Change: ${formatPercentage(technicalAnalysis?.priceChange3m)}
+- Volume Change: ${formatPercentage(technicalAnalysis?.volumeChange)}
+- 52-Week High: ${formatNumber(technicalAnalysis?.high52Week, 2)}
+- 52-Week Low: ${formatNumber(technicalAnalysis?.low52Week, 2)}
+- % From 52-Week High: ${formatPercentage(technicalAnalysis?.distanceFromHigh)}
+- % From 52-Week Low: ${formatPercentage(technicalAnalysis?.distanceFromLow)}
 
-Current Price: $${currentPrice.toFixed(2)}
+Current Price: ${formatNumber(currentPrice, 2)}
+Last Updated: ${new Date().toISOString()}
 
 Respond with only a JSON object containing:
 {
@@ -455,6 +559,21 @@ Respond with only a JSON object containing:
   "confidence": 0-100
 }
   `;
+}
+
+// Helper functions to format numbers and percentages nicely
+function formatNumber(num, decimals = 0) {
+  if (num === undefined || num === null) return 'N/A';
+  return Number(num).toLocaleString('en-US', { 
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals
+  });
+}
+
+function formatPercentage(percent) {
+  if (percent === undefined || percent === null) return 'N/A';
+  return percent.toFixed(2) + '%';
+}
 }
 
 // Generate a fingerprint of the data for caching purposes
