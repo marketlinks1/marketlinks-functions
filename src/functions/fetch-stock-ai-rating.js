@@ -2,7 +2,7 @@ const fetch = require('node-fetch');
 const fs = require('fs');
 const path = require('path');
 
-// Create a simple file-based caching system instead of Firebase
+// Create a simple file-based caching system
 const CACHE_DIR = path.join('/tmp', 'stock-cache');
 
 // Ensure the cache directory exists
@@ -123,9 +123,12 @@ exports.handler = async (event) => {
   const cacheKey = `prediction_${upperSymbol}`;
   
   try {
+    console.time('Total Processing Time');
+    
     // Check memory cache first (fastest)
     const cachedResult = memoryCache.get(cacheKey);
     if (cachedResult) {
+      console.timeEnd('Total Processing Time');
       return createResponse(200, corsHeader, cachedResult, true);
     }
     
@@ -134,36 +137,46 @@ exports.handler = async (event) => {
     if (cachedData && isDataFresh(cachedData.lastFetched, 24)) { // 24 hour validity
       // Store in memory cache to speed up future requests
       memoryCache.set(cacheKey, cachedData.data);
+      console.timeEnd('Total Processing Time');
       return createResponse(200, corsHeader, cachedData.data, true);
     }
 
+    console.time('Data Fetching');
     // Fetch only essential data with limited fields
     const fetchedData = await fetchOptimizedData(upperSymbol);
+    console.timeEnd('Data Fetching');
+    
     if (!fetchedData) {
       throw new Error('Failed to fetch stock data.');
     }
 
+    console.time('Technical Analysis');
     // Add locally calculated technical indicators
     fetchedData.technicalAnalysis = calculateTechnicals(fetchedData.priceHistory);
+    console.timeEnd('Technical Analysis');
     
+    console.time('Claude API Call');
     // Generate AI prompt with only the necessary data
-    const aiPrediction = await getAIPrediction(fetchedData, upperSymbol);
+    const aiPrediction = await getClaudePrediction(fetchedData, upperSymbol);
+    console.timeEnd('Claude API Call');
 
     // Save prediction to file cache
     const resultToStore = {
       lastFetched: Date.now(),
       data: { 
         recommendation: aiPrediction, 
-        fetchedData 
+        fetchedData,
+        apiUsed: 'Claude'
       }
     };
     
     await writeToFileCache(upperSymbol, resultToStore);
     
     // Cache the result in memory
-    const resultToReturn = { recommendation: aiPrediction, fetchedData };
+    const resultToReturn = { recommendation: aiPrediction, fetchedData, apiUsed: 'Claude' };
     memoryCache.set(cacheKey, resultToReturn);
 
+    console.timeEnd('Total Processing Time');
     return createResponse(200, corsHeader, resultToReturn);
   } catch (error) {
     console.error('Error:', error.message);
@@ -436,54 +449,77 @@ function getDataFingerprint(data) {
   return `${fundamentals.date || ''}_${(technicalAnalysis.rsi || 0).toFixed(1)}_${(technicalAnalysis.priceChange1m || 0).toFixed(1)}`;
 }
 
-// Use a streamlined approach for AI prediction with essential data only
-async function getAIPrediction(data, symbol) {
+// Use Claude API for prediction instead of OpenAI
+async function getClaudePrediction(data, symbol) {
   // Get the current price from technical analysis data
   const currentPrice = data.technicalAnalysis?.currentPrice || 0;
   
   // Prepare a compact prompt with only essential data
-  const compactPrompt = createCompactPrompt(data, symbol);
+  const prompt = createClaudePrompt(data, symbol);
   
   try {
-    // Creating a more unique fingerprint based on current price and time
-    // This ensures we get fresh predictions when prices change significantly
+    // Creating a unique fingerprint based on current price and time
     const dataFingerprint = getDataFingerprint(data);
     const priceFingerprint = `${currentPrice.toFixed(2)}`;
-    const cacheKey = `ai_${symbol}_${dataFingerprint}_${priceFingerprint}`;
+    const cacheKey = `claude_${symbol}_${dataFingerprint}_${priceFingerprint}`;
     
     // Check if we can reuse a cached model response
     const cachedPrediction = memoryCache.get(cacheKey);
     if (cachedPrediction) return cachedPrediction;
     
-    console.log(`Requesting fresh AI prediction for ${symbol} at $${currentPrice.toFixed(2)}`);
+    console.log(`Requesting fresh Claude prediction for ${symbol} at $${currentPrice.toFixed(2)}`);
     
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    // Track token usage for cost analysis
+    const promptTokens = estimateTokens(prompt);
+    console.log(`Estimated input tokens: ${promptTokens}`);
+    
+    // Make API call to Claude
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        'x-api-key': process.env.CLAUDE_API,
+        'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        messages: [{ role: 'user', content: compactPrompt }],
+        model: 'claude-3-sonnet-20240229',
         max_tokens: 500,
         temperature: 0.4,
-        response_format: { type: "json_object" } // Request direct JSON response
+        system: "You are a skilled financial analyst providing stock recommendations. Your task is to analyze the provided financial data and provide a concise investment recommendation in JSON format. Focus only on the data provided and make your best determination based on fundamental and technical analysis.",
+        messages: [
+          { 
+            role: 'user', 
+            content: prompt
+          }
+        ],
+        response_format: { type: "json_object" }
       }),
     });
 
     if (!response.ok) {
-      throw new Error(`OpenAI API Error: ${response.statusText}`);
+      console.error(`Claude API error: ${response.status} ${response.statusText}`);
+      const errorBody = await response.text();
+      console.error('Error details:', errorBody);
+      throw new Error(`Claude API Error: ${response.statusText}`);
     }
 
     const result = await response.json();
+    console.log('Claude API Response:', JSON.stringify(result, null, 2));
+    
+    // Track output tokens for cost analysis
+    const outputTokens = estimateTokens(result.content[0].text);
+    console.log(`Estimated output tokens: ${outputTokens}`);
+    console.log(`Estimated cost: $${((promptTokens * 0.000005) + (outputTokens * 0.000015)).toFixed(6)}`);
+    
     let prediction;
     
     try {
-      prediction = JSON.parse(result.choices[0].message.content);
+      // Extract the JSON from Claude's response
+      prediction = JSON.parse(result.content[0].text);
     } catch (err) {
-      console.error('Error parsing AI response:', err);
-      throw new Error('Failed to parse AI response');
+      console.error('Error parsing Claude response:', err);
+      console.error('Raw response:', result.content[0].text);
+      throw new Error('Failed to parse Claude response');
     }
     
     // Ensure all fields are present and formatted correctly
@@ -493,23 +529,37 @@ async function getAIPrediction(data, symbol) {
       targetPrice: parseFloat(prediction.targetPrice) || currentPrice,
       upside: parseFloat(prediction.upside) || ((prediction.targetPrice / currentPrice - 1) * 100).toFixed(1),
       confidence: parseInt(prediction.confidence) || 50,
-      analysisTime: new Date().toISOString()
+      analysisTime: new Date().toISOString(),
+      tokensUsed: {
+        input: promptTokens,
+        output: outputTokens,
+        estimatedCost: ((promptTokens * 0.000005) + (outputTokens * 0.000015)).toFixed(6)
+      }
     };
     
-    // Cache the AI prediction - reduced cache time to ensure freshness
+    // Cache the Claude prediction - reduced cache time to ensure freshness
     memoryCache.set(cacheKey, formattedPrediction, 3600); // 1 hour cache
     
     return formattedPrediction;
   } catch (err) {
-    console.error('Error getting AI prediction:', err);
+    console.error('Error getting Claude prediction:', err);
     
     // Fallback to a basic recommendation based on technical indicators
     return generateFallbackRecommendation(data);
   }
 }
 
-// Create a compact prompt for the AI with only essential data
-function createCompactPrompt(data, symbol) {
+// Rough token estimator (not exact but useful for tracking costs)
+function estimateTokens(text) {
+  if (typeof text === 'object') {
+    text = JSON.stringify(text);
+  }
+  // Rough estimate: 1 token ≈ 4 characters for English text
+  return Math.ceil(text.length / 4);
+}
+
+// Create a financial analysis prompt for Claude
+function createClaudePrompt(data, symbol) {
   const { fundamentals, balanceSheet, technicalAnalysis, currentQuote } = data;
   
   // Use technicalAnalysis.currentPrice which is most up-to-date
@@ -522,8 +572,10 @@ function createCompactPrompt(data, symbol) {
   }
   
   return `
-You are an AI financial analyst. Based on the following real-time data for ${symbol}, provide a recommendation: BUY, SELL, or HOLD.
+Analyze the following real-time financial data for ${symbol} and provide your investment recommendation.
 
+FINANCIAL DATA:
+-------------------
 Key Fundamentals:
 - Revenue: ${formatNumber(fundamentals?.revenue)}
 - Net Income: ${formatNumber(fundamentals?.netIncome)}
@@ -552,17 +604,28 @@ Technical Indicators:
 - % From 52-Week Low: ${formatPercentage(technicalAnalysis?.distanceFromLow)}
 
 Current Price: $${formatNumber(currentPrice, 2)}
-Last Updated: ${new Date().toISOString()}
+Date of Analysis: ${new Date().toISOString()}
 
-Respond with only a JSON object containing:
+TASK:
+-------------------
+Based solely on this data, analyze the stock and provide an investment recommendation.
+
+Your response must be in valid JSON format with the following fields:
+- recommendation: "BUY", "SELL", or "HOLD"
+- reason: A brief explanation of your recommendation (1-2 sentences)
+- targetPrice: A numerical value representing your 12-month price target
+- upside: A percentage representing potential upside or downside from current price
+- confidence: A number from 0-100 representing your confidence in this recommendation
+
+Example format:
 {
-  "recommendation": "BUY/SELL/HOLD",
-  "reason": "Brief explanation of your recommendation (1-2 sentences)",
-  "targetPrice": numerical value representing your 12-month price target,
-  "upside": percentage representing potential upside or downside from current price,
-  "confidence": 0-100
+  "recommendation": "BUY",
+  "reason": "Strong fundamentals with recent price decline creating entry opportunity.",
+  "targetPrice": 155.75,
+  "upside": 12.5,
+  "confidence": 75
 }
-  `;
+`;
 }
 
 // Helper functions to format numbers and percentages nicely
@@ -591,7 +654,8 @@ function generateFallbackRecommendation(data) {
       targetPrice: currentPrice || 0,
       upside: 0,
       confidence: 30,
-      analysisTime: new Date().toISOString()
+      analysisTime: new Date().toISOString(),
+      note: "This is a fallback recommendation due to API error."
     };
   }
   
@@ -610,7 +674,8 @@ function generateFallbackRecommendation(data) {
       targetPrice: parseFloat(targetPrice.toFixed(2)),
       upside: upside,
       confidence: 60,
-      analysisTime: new Date().toISOString()
+      analysisTime: new Date().toISOString(),
+      note: "This is a fallback recommendation due to API error."
     };
   } else if (rsi > 70 && priceChange1m > 10) {
     // For overbought stocks, estimate a 10% correction
@@ -622,7 +687,8 @@ function generateFallbackRecommendation(data) {
       targetPrice: parseFloat(targetPrice.toFixed(2)),
       upside: upside,
       confidence: 60,
-      analysisTime: new Date().toISOString()
+      analysisTime: new Date().toISOString(),
+      note: "This is a fallback recommendation due to API error."
     };
   } else {
     // For neutral stocks, use SMA50 as reference or estimate modest 5% growth
@@ -634,7 +700,8 @@ function generateFallbackRecommendation(data) {
       targetPrice: parseFloat(targetPrice.toFixed(2)),
       upside: parseFloat(upside.toFixed(1)),
       confidence: 50,
-      analysisTime: new Date().toISOString()
+      analysisTime: new Date().toISOString(),
+      note: "This is a fallback recommendation due to API error."
     };
   }
 }
