@@ -1,29 +1,18 @@
 const fetch = require('node-fetch');
-const admin = require('firebase-admin');
-const NodeCache = require('node-memory-cache');
+const fs = require('fs');
+const path = require('path');
 
-// Initialize in-memory cache with TTL
-const memoryCache = new NodeCache({ stdTTL: 3600 }); // 1 hour cache
+// Create a simple file-based caching system instead of Firebase
+const CACHE_DIR = path.join('/tmp', 'stock-cache');
 
-// Initialize Firebase only once
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert({
-      type: process.env.FIREBASE_TYPE,
-      project_id: process.env.FIREBASE_PROJECT_ID,
-      private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-      private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-      client_email: process.env.FIREBASE_CLIENT_EMAIL,
-      client_id: process.env.FIREBASE_CLIENT_ID,
-      auth_uri: process.env.FIREBASE_AUTH_URI,
-      token_uri: process.env.FIREBASE_TOKEN_URI,
-      auth_provider_x509_cert_url: process.env.FIREBASE_AUTH_PROVIDER_X509_CERT_URL,
-      client_x509_cert_url: process.env.FIREBASE_CLIENT_X509_CERT_URL,
-    }),
-  });
+// Ensure the cache directory exists
+try {
+  if (!fs.existsSync(CACHE_DIR)) {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+  }
+} catch (error) {
+  console.error('Error creating cache directory:', error);
 }
-
-const db = admin.firestore();
 
 // Define allowed origins
 const allowedOrigins = [
@@ -84,6 +73,29 @@ const technicalIndicators = {
   }
 };
 
+// In-memory cache for ultra-fast responses
+const memoryCache = {
+  data: {},
+  get: function(key) {
+    const item = this.data[key];
+    if (!item) return null;
+    
+    // Check if cache is still valid
+    if (Date.now() > item.expiry) {
+      delete this.data[key];
+      return null;
+    }
+    
+    return item.value;
+  },
+  set: function(key, value, ttlSeconds = 3600) {
+    this.data[key] = {
+      value,
+      expiry: Date.now() + (ttlSeconds * 1000)
+    };
+  }
+};
+
 exports.handler = async (event) => {
   const origin = event.headers.origin;
   const corsHeader = origin && allowedOrigins.includes(origin) ? origin : allowedOrigins[0];
@@ -117,21 +129,12 @@ exports.handler = async (event) => {
       return createResponse(200, corsHeader, cachedResult, true);
     }
     
-    // Check Firestore next (medium speed)
-    const docRef = db.collection('aiPredictions').doc(upperSymbol);
-    const docSnap = await docRef.get();
-    const now = admin.firestore.Timestamp.now();
-
-    if (docSnap.exists) {
-      const { lastFetched, recommendation, fetchedData } = docSnap.data();
-      const hoursElapsed = (now.toDate() - lastFetched.toDate()) / (1000 * 60 * 60);
-      
-      if (hoursElapsed < 24) {
-        // Store in memory cache to speed up future requests
-        const result = { recommendation, fetchedData };
-        memoryCache.set(cacheKey, result);
-        return createResponse(200, corsHeader, result, true);
-      }
+    // Check file cache next
+    const cachedData = await readFromFileCache(upperSymbol);
+    if (cachedData && isDataFresh(cachedData.lastFetched, 24)) { // 24 hour validity
+      // Store in memory cache to speed up future requests
+      memoryCache.set(cacheKey, cachedData.data);
+      return createResponse(200, corsHeader, cachedData.data, true);
     }
 
     // Fetch only essential data with limited fields
@@ -146,15 +149,16 @@ exports.handler = async (event) => {
     // Generate AI prompt with only the necessary data
     const aiPrediction = await getAIPrediction(fetchedData, upperSymbol);
 
-    // Save prediction to Firestore
+    // Save prediction to file cache
     const resultToStore = {
-      symbol: upperSymbol,
-      recommendation: aiPrediction,
-      fetchedData,
-      lastFetched: now,
+      lastFetched: Date.now(),
+      data: { 
+        recommendation: aiPrediction, 
+        fetchedData 
+      }
     };
     
-    await docRef.set(resultToStore);
+    await writeToFileCache(upperSymbol, resultToStore);
     
     // Cache the result in memory
     const resultToReturn = { recommendation: aiPrediction, fetchedData };
@@ -166,6 +170,38 @@ exports.handler = async (event) => {
     return createResponse(500, corsHeader, { error: error.message });
   }
 };
+
+// File cache functions
+async function readFromFileCache(symbol) {
+  const cacheFile = path.join(CACHE_DIR, `${symbol}.json`);
+  
+  try {
+    if (fs.existsSync(cacheFile)) {
+      const data = fs.readFileSync(cacheFile, 'utf8');
+      return JSON.parse(data);
+    }
+  } catch (error) {
+    console.error('Error reading from cache:', error);
+  }
+  
+  return null;
+}
+
+async function writeToFileCache(symbol, data) {
+  const cacheFile = path.join(CACHE_DIR, `${symbol}.json`);
+  
+  try {
+    fs.writeFileSync(cacheFile, JSON.stringify(data), 'utf8');
+  } catch (error) {
+    console.error('Error writing to cache:', error);
+  }
+}
+
+function isDataFresh(timestamp, hoursValid) {
+  const now = Date.now();
+  const hoursElapsed = (now - timestamp) / (1000 * 60 * 60);
+  return hoursElapsed < hoursValid;
+}
 
 // Create JSON response with CORS headers and cache control
 function createResponse(statusCode, corsHeader, body, fromCache = false) {
@@ -190,35 +226,22 @@ async function fetchOptimizedData(symbol) {
   if (cachedData) return cachedData;
 
   try {
-    // Batch requests to reduce network overhead
-    const batchEndpoint = `https://financialmodelingprep.com/api/v4/batch?apikey=${apiKey}`;
+    // Make separate requests since FMP might not support batch requests on the free tier
+    const endpoints = [
+      `https://financialmodelingprep.com/api/v3/income-statement/${symbol}?limit=1&apikey=${apiKey}`,
+      `https://financialmodelingprep.com/api/v3/balance-sheet-statement/${symbol}?limit=1&apikey=${apiKey}`,
+      `https://financialmodelingprep.com/api/v3/historical-price-full/${symbol}?from=${getDateXMonthsAgo(12)}&apikey=${apiKey}`
+    ];
     
-    const requestBody = {
-      symbols: [symbol],
-      endpoints: [
-        "income-statement-limited", 
-        "balance-sheet-statement-limited",
-        "historical-price-full/1year"
-      ]
-    };
-    
-    const response = await fetch(batchEndpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(requestBody)
-    });
-    
-    if (!response.ok) {
-      throw new Error(`FMP API Error: ${response.statusText}`);
-    }
-    
-    const data = await response.json();
+    const [incomeRes, balanceRes, priceRes] = await Promise.all(
+      endpoints.map(url => fetch(url).then(res => res.json()))
+    );
     
     // Extract and process relevant data only
     const result = {
-      fundamentals: extractEssentialFinancials(data[`${symbol}_income-statement-limited`]?.[0]),
-      balanceSheet: extractEssentialBalanceSheet(data[`${symbol}_balance-sheet-statement-limited`]?.[0]),
-      priceHistory: extractPriceHistory(data[`${symbol}_historical-price-full/1year`])
+      fundamentals: extractEssentialFinancials(incomeRes[0]),
+      balanceSheet: extractEssentialBalanceSheet(balanceRes[0]),
+      priceHistory: extractPriceHistory(priceRes)
     };
     
     // Cache the result
@@ -226,9 +249,16 @@ async function fetchOptimizedData(symbol) {
     
     return result;
   } catch (error) {
-    console.error('Error fetching batch data:', error.message);
+    console.error('Error fetching data:', error.message);
     return null;
   }
+}
+
+// Get date X months ago in YYYY-MM-DD format
+function getDateXMonthsAgo(months) {
+  const date = new Date();
+  date.setMonth(date.getMonth() - months);
+  return date.toISOString().split('T')[0];
 }
 
 // Extract only essential financial metrics
@@ -414,7 +444,7 @@ Technical Indicators:
 - 3-Month Price Change: ${technicalAnalysis?.priceChange3m}%
 - Volume Change: ${technicalAnalysis?.volumeChange}%
 
-Current Price: ${currentPrice.toFixed(2)}
+Current Price: $${currentPrice.toFixed(2)}
 
 Respond with only a JSON object containing:
 {
