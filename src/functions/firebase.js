@@ -3,7 +3,7 @@ exports.handler = async function(event, context) {
   // Implement CORS for your Webflow domain
   const allowedOrigins = [
     'www.themarketlinks.com',  // Replace with your actual Webflow domain
-   
+  
   ];
   
   const origin = event.headers.origin || '';
