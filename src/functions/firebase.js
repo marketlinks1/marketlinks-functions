@@ -1,9 +1,11 @@
-// functions/firebase-config.js
+// functions/firebase.js
 exports.handler = async function(event, context) {
-  // Implement CORS for your Webflow domain
+  // Implement CORS with the correct origin format
   const allowedOrigins = [
-    'www.themarketlinks.com',  // Replace with your actual Webflow domain
-  
+    'https://www.themarketlinks.com',
+    'http://www.themarketlinks.com',
+    'https://themarketlinks.com',
+    'http://themarketlinks.com'
   ];
   
   const origin = event.headers.origin || '';
@@ -23,7 +25,8 @@ exports.handler = async function(event, context) {
     statusCode: 200,
     headers: {
       'Access-Control-Allow-Origin': isAllowedOrigin ? origin : allowedOrigins[0],
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
       'Content-Type': 'application/json'
     },
     body: JSON.stringify(firebaseConfig)
