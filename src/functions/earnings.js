@@ -6,6 +6,7 @@ const axios = require('axios');
 // Fixed batch size to prevent EMFILE errors (too many open files)
 const BATCH_SIZE = 5; // Reduced from 25 to prevent hitting system limits
 const MAX_CONCURRENT_REQUESTS = 3; // Limit concurrent requests
+const MAX_RESULTS = 100; // Limit number of results to prevent response size exceeding 6MB
 
 exports.handler = async function(event, context) {
   // Set CORS headers
@@ -36,11 +37,37 @@ exports.handler = async function(event, context) {
     const queryParams = event.queryStringParameters || {};
     const from = queryParams.from || '';
     const to = queryParams.to || '';
+    const page = parseInt(queryParams.page || '1');
+    const limit = parseInt(queryParams.limit || '50');
+    const sortBy = queryParams.sortBy || 'volume';
+    const sortDirection = queryParams.sortDirection || 'desc';
+    const symbol = queryParams.symbol || '';
+    const sector = queryParams.sector || '';
+    
+    // If no date range provided, use current week
+    let fromDate = from;
+    let toDate = to;
+    
+    if (!fromDate || !toDate) {
+      const today = new Date();
+      // Get Monday of current week
+      const day = today.getDay();
+      const diff = today.getDate() - day + (day === 0 ? -6 : 1);
+      const monday = new Date(today.setDate(diff));
+      // Get Sunday of current week
+      const sunday = new Date(monday);
+      sunday.setDate(monday.getDate() + 6);
+      
+      fromDate = monday.toISOString().split('T')[0];
+      toDate = sunday.toISOString().split('T')[0];
+      
+      console.log(`No date range provided, using current week: ${fromDate} to ${toDate}`);
+    }
     
     // Build request parameters
     const params = { apikey: apiKey };
-    if (from) params.from = from;
-    if (to) params.to = to;
+    if (fromDate) params.from = fromDate;
+    if (toDate) params.to = toDate;
 
     // Fetch earnings calendar data
     console.log('Fetching earnings calendar data...');
@@ -49,52 +76,97 @@ exports.handler = async function(event, context) {
       { params }
     );
 
-    // Process the data without additional API calls if there are too many symbols
-    const earningsData = response.data;
+    // Process the data without additional API calls to reduce load
+    let earningsData = response.data;
     
-    // If we have a lot of earnings reports, skip additional API calls to avoid EMFILE errors
-    if (earningsData.length > 100) {
-      console.log(`Found ${earningsData.length} earnings reports. Skipping additional data enrichment to prevent EMFILE errors.`);
-      
-      // Just return the basic earnings data
-      const processedData = earningsData.map(item => ({
-        ...item,
-        companyName: item.company || "",
-        sector: "N/A", // We don't have this data without additional API calls
-        volume: 0,     // We don't have this data without additional API calls
-        avgVolume: 0,  // We don't have this data without additional API calls
-        marketCap: 0,  // We don't have this data without additional API calls
-        time: item.time || "N/A",
-        eps: {
-          estimate: item.epsEstimated || null,
-          actual: item.eps || null,
-          surprise: item.epsSurprise || null
-        },
-        revenue: {
-          estimate: item.revenueEstimated || null,
-          actual: item.revenue || null,
-          surprise: item.revenueSurprise || null
-        }
-      }));
-      
-      return {
-        statusCode: 200,
-        headers,
-        body: JSON.stringify({
-          earningsCalendar: processedData
-        })
-      };
+    console.log(`Found ${earningsData.length} earnings reports.`);
+    
+    // Apply filters if provided
+    if (symbol) {
+      earningsData = earningsData.filter(item => 
+        item.symbol.toLowerCase().includes(symbol.toLowerCase())
+      );
     }
     
-    // For smaller datasets, try to enhance with additional data
-    console.log(`Found ${earningsData.length} earnings reports. Enriching with additional data.`);
-    const enhancedData = await enhanceEarningsData(earningsData, apiKey);
-
+    // Basic preprocessing of data
+    const processedData = earningsData.map(item => ({
+      ...item,
+      companyName: item.company || "",
+      sector: "N/A", // Will be populated for the limited displayed items
+      volume: 0,     // Will be populated for the limited displayed items
+      avgVolume: 0,  // Will be populated for the limited displayed items
+      marketCap: 0,  // Will be populated for the limited displayed items
+      time: item.time || "N/A",
+      eps: {
+        estimate: item.epsEstimated || null,
+        actual: item.eps || null,
+        surprise: item.epsSurprise || null
+      },
+      revenue: {
+        estimate: item.revenueEstimated || null,
+        actual: item.revenue || null,
+        surprise: item.revenueSurprise || null
+      }
+    }));
+    
+    // Sort data based on parameters
+    let sortedData = [...processedData];
+    if (sortBy === 'volume') {
+      // We'll sort by date as a default since we don't have volume data yet
+      sortedData.sort((a, b) => {
+        const dateA = new Date(a.date).getTime();
+        const dateB = new Date(b.date).getTime();
+        return sortDirection === 'asc' ? dateA - dateB : dateB - dateA;
+      });
+    } else if (sortBy === 'eps') {
+      sortedData.sort((a, b) => {
+        const epsA = a.eps?.estimate || 0;
+        const epsB = b.eps?.estimate || 0;
+        return sortDirection === 'asc' ? epsA - epsB : epsB - epsA;
+      });
+    } else {
+      // Default sort by date
+      sortedData.sort((a, b) => {
+        const dateA = new Date(a.date).getTime();
+        const dateB = new Date(b.date).getTime();
+        return sortDirection === 'asc' ? dateA - dateB : dateB - dateA;
+      });
+    }
+    
+    // Calculate total pages and limits for pagination
+    const totalItems = sortedData.length;
+    const totalPages = Math.ceil(totalItems / limit);
+    const startIndex = (page - 1) * limit;
+    const endIndex = startIndex + limit;
+    
+    // Get the paginated data
+    const paginatedData = sortedData.slice(startIndex, endIndex);
+    
+    // For the paginated subset, get additional data
+    const enhancedPaginatedData = await enhanceEarningsData(paginatedData, apiKey, sector);
+    
+    // Get unique dates and sectors from the entire dataset (for filters)
+    const uniqueDates = [...new Set(processedData.map(item => item.date))].filter(Boolean).sort();
+    
+    // Build metadata for pagination and filters
+    const metadata = {
+      pagination: {
+        currentPage: page,
+        totalPages: totalPages,
+        totalItems: totalItems,
+        itemsPerPage: limit
+      },
+      filters: {
+        dates: uniqueDates.slice(0, 30) // Limit to prevent response size issues
+      }
+    };
+    
     return {
       statusCode: 200,
       headers,
       body: JSON.stringify({
-        earningsCalendar: enhancedData
+        earningsCalendar: enhancedPaginatedData,
+        metadata: metadata
       })
     };
   } catch (error) {
@@ -105,9 +177,7 @@ exports.handler = async function(event, context) {
       headers,
       body: JSON.stringify({ 
         error: 'Failed to fetch earnings data',
-        message: error.message,
-        // Don't return full error details in production, but useful for debugging
-        stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+        message: error.message
       })
     };
   }
@@ -132,7 +202,7 @@ async function processBatchesWithLimits(batches, processBatch) {
   return results;
 }
 
-async function enhanceEarningsData(earningsData, apiKey) {
+async function enhanceEarningsData(earningsData, apiKey, sectorFilter) {
   try {
     // Get unique symbols from earnings data
     const symbols = [...new Set(earningsData.map(item => item.symbol))];
@@ -195,8 +265,17 @@ async function enhanceEarningsData(earningsData, apiKey) {
     
     console.log(`Successfully fetched additional data for ${Object.keys(profileData).length} profiles and ${Object.keys(quoteData).length} quotes`);
     
+    // Apply sector filter if provided
+    let filteredData = earningsData;
+    if (sectorFilter) {
+      filteredData = earningsData.filter(item => {
+        const profile = profileData[item.symbol] || {};
+        return profile.sector === sectorFilter;
+      });
+    }
+    
     // Enhance earnings data with profile and quote information
-    return earningsData.map(item => {
+    return filteredData.map(item => {
       const profile = profileData[item.symbol] || {};
       const quote = quoteData[item.symbol] || {};
       
