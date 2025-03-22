@@ -1,4 +1,4 @@
-// ai-earnings.js - Fetch historical and next quarter's earnings
+// ai-earnings.js - Fixed function for next quarter earnings
 const fetch = require('node-fetch');
 
 exports.handler = async function(event, context) {
@@ -52,36 +52,34 @@ exports.handler = async function(event, context) {
   console.log(`Processing earnings request for symbol: ${symbolToUse}, period: ${period}`);
   
   try {
-    // 1. First, get historical earnings data
-    const calendarUrl = `https://financialmodelingprep.com/api/v3/historical/earning_calendar/${symbolToUse}?apikey=${apiKey}`;
+    // 1. Get historical earnings data first
+    const earningsUrl = `https://financialmodelingprep.com/api/v3/historical/earning_calendar/${symbolToUse}?apikey=${apiKey}`;
     
-    const calendarResponse = await fetch(calendarUrl);
+    const earningsResponse = await fetch(earningsUrl);
     
-    if (!calendarResponse.ok) {
-      console.error(`Historical earnings calendar API request failed with status ${calendarResponse.status}`);
+    if (!earningsResponse.ok) {
+      console.error(`Historical earnings calendar API request failed with status ${earningsResponse.status}`);
       return {
-        statusCode: calendarResponse.status,
+        statusCode: earningsResponse.status,
         body: JSON.stringify({ 
-          error: `Financial API returned an error: ${calendarResponse.status}`,
+          error: `Financial API returned an error: ${earningsResponse.status}`,
           symbol: symbolToUse 
         })
       };
     }
     
-    let historicalData = await calendarResponse.json();
+    let historicalData = await earningsResponse.json();
     
+    // If we have no data, try fallbacks
     if (!Array.isArray(historicalData) || historicalData.length === 0) {
-      console.log(`No data returned from historical earnings calendar API for symbol ${symbolToUse}`);
+      // Try earnings-surprises endpoint
+      const surprisesUrl = `https://financialmodelingprep.com/api/v3/earnings-surprises/${symbolToUse}?apikey=${apiKey}`;
+      const surprisesResponse = await fetch(surprisesUrl);
       
-      // Try fallback to earnings-surprises endpoint
-      console.log('Trying fallback to earnings-surprises endpoint');
-      const fallbackUrl = `https://financialmodelingprep.com/api/v3/earnings-surprises/${symbolToUse}?apikey=${apiKey}`;
-      const fallbackResponse = await fetch(fallbackUrl);
-      
-      if (fallbackResponse.ok) {
-        const fallbackData = await fallbackResponse.json();
-        if (Array.isArray(fallbackData) && fallbackData.length > 0) {
-          historicalData = fallbackData.map(item => ({
+      if (surprisesResponse.ok) {
+        const surprisesData = await surprisesResponse.json();
+        if (Array.isArray(surprisesData) && surprisesData.length > 0) {
+          historicalData = surprisesData.map(item => ({
             date: item.date,
             symbol: symbolToUse,
             eps: item.actualEps,
@@ -93,9 +91,8 @@ exports.handler = async function(event, context) {
         }
       }
       
-      // If still no data, try income statement as a last resort
+      // If still no data, try income statement
       if (!historicalData || historicalData.length === 0) {
-        console.log('Trying fallback to income statement endpoint');
         const incomeUrl = `https://financialmodelingprep.com/api/v3/income-statement/${symbolToUse}?period=${period === 'annual' ? 'annual' : 'quarter'}&limit=4&apikey=${apiKey}`;
         const incomeResponse = await fetch(incomeUrl);
         
@@ -128,79 +125,7 @@ exports.handler = async function(event, context) {
       };
     }
     
-    // Sort historical data by date, newest first
-    historicalData.sort((a, b) => new Date(b.date) - new Date(a.date));
-    
-    // 2. Now get analysts' estimate data for upcoming quarters
-    let nextQuarterData = null;
-    try {
-      const estimatesUrl = `https://financialmodelingprep.com/api/v3/analyst-estimates/${symbolToUse}?apikey=${apiKey}`;
-      const estimatesResponse = await fetch(estimatesUrl);
-      
-      if (estimatesResponse.ok) {
-        const estimatesData = await estimatesResponse.json();
-        
-        if (Array.isArray(estimatesData) && estimatesData.length > 0) {
-          // Get the most recent reported quarter/year from historical data
-          const lastReportDate = new Date(historicalData[0].date);
-          const lastReportYear = lastReportDate.getFullYear();
-          const lastReportQuarter = Math.floor((lastReportDate.getMonth() + 3) / 3);
-          
-          // Determine next quarter and year
-          let nextQuarter = lastReportQuarter + 1;
-          let nextYear = lastReportYear;
-          if (nextQuarter > 4) {
-            nextQuarter = 1;
-            nextYear++;
-          }
-          
-          // Create a data structure for the next quarter's estimate
-          nextQuarterData = {
-            date: new Date(nextYear, (nextQuarter - 1) * 3, 15).toISOString().split('T')[0], // Approximation
-            symbol: symbolToUse,
-            fiscalPeriod: `Q${nextQuarter} '${nextYear.toString().slice(2)}`,
-            estimatedEps: null,
-            actualEps: null,
-            surprisePercentage: null,
-            estimatedRevenue: null,
-            actualRevenue: null,
-            isUpcoming: true
-          };
-          
-          // Look for matching quarter estimate in the estimates data
-          const estimate = estimatesData.find(est => {
-            const estDate = new Date(est.date);
-            const estYear = estDate.getFullYear();
-            const estQuarter = est.period ? parseInt(est.period.replace('Q', '')) : Math.floor((estDate.getMonth() + 3) / 3);
-            return estYear === nextYear && estQuarter === nextQuarter;
-          });
-          
-          if (estimate) {
-            nextQuarterData.estimatedEps = estimate.estimatedEpsAvg || estimate.epsAvg || estimate.epsEstimated;
-            nextQuarterData.estimatedRevenue = estimate.estimatedRevenueAvg || estimate.revenueAvg || estimate.estimatedRevenue;
-          } else {
-            // If we can't find a specific quarter estimate, check the analyst estimates endpoint
-            const analystUrl = `https://financialmodelingprep.com/api/v3/analyst-estimates/${symbolToUse}?apikey=${apiKey}`;
-            const analystResponse = await fetch(analystUrl);
-            
-            if (analystResponse.ok) {
-              const analystData = await analystResponse.json();
-              if (Array.isArray(analystData) && analystData.length > 0) {
-                // Take the first/most recent estimate
-                const latestEstimate = analystData[0];
-                nextQuarterData.estimatedEps = latestEstimate.epsAvg;
-                nextQuarterData.estimatedRevenue = latestEstimate.revenueAvg;
-              }
-            }
-          }
-        }
-      }
-    } catch (error) {
-      console.log('Error fetching next quarter estimates, continuing without them:', error);
-      // Continue without next quarter data
-    }
-    
-    // Filter historical data by period if requested
+    // Filter data by period if needed and sort by date (newest first)
     let filteredData = historicalData;
     if (period === 'annual') {
       // For annual, group by year and take the last report of each year
@@ -212,17 +137,144 @@ exports.handler = async function(event, context) {
         }
       });
       filteredData = Object.values(yearGroups);
-      // Sort by date, newest first
-      filteredData.sort((a, b) => new Date(b.date) - new Date(a.date));
     }
     
-    // Take only the most recent 3 reports
+    filteredData.sort((a, b) => new Date(b.date) - new Date(a.date));
+    
+    // 2. Now try to get next quarter's estimate
+    let nextQuarterData = null;
+    
+    // Get the most recent quarter data
+    if (filteredData.length > 0 && period === 'quarterly') {
+      const lastQuarterData = filteredData[0];
+      const lastDate = new Date(lastQuarterData.date);
+      
+      // Calculate the fiscal quarter from the date
+      const lastMonth = lastDate.getMonth();
+      const lastQuarter = Math.floor(lastMonth / 3) + 1; // 1-4
+      const lastYear = lastDate.getFullYear();
+      
+      // Calculate next quarter and year
+      let nextQuarter = lastQuarter + 1;
+      let nextYear = lastYear;
+      if (nextQuarter > 4) {
+        nextQuarter = 1;
+        nextYear++;
+      }
+      
+      // Format the next quarter's fiscal period
+      const nextFiscalPeriod = `Q${nextQuarter} '${nextYear.toString().slice(2)}`;
+      
+      // Try to get analyst estimates for next quarter
+      try {
+        // First try earnings calendar for upcoming earnings
+        const upcomingUrl = `https://financialmodelingprep.com/api/v3/earning_calendar?symbol=${symbolToUse}&apikey=${apiKey}`;
+        const upcomingResponse = await fetch(upcomingUrl);
+        
+        if (upcomingResponse.ok) {
+          const upcomingData = await upcomingResponse.json();
+          if (Array.isArray(upcomingData) && upcomingData.length > 0) {
+            // Find the next quarter's data
+            const now = new Date();
+            const futureEarnings = upcomingData.filter(item => new Date(item.date) > now);
+            
+            if (futureEarnings.length > 0) {
+              // Sort by date and take the closest upcoming one
+              futureEarnings.sort((a, b) => new Date(a.date) - new Date(b.date));
+              const nextEarnings = futureEarnings[0];
+              
+              // Get the quarter from the date
+              const earningsDate = new Date(nextEarnings.date);
+              const earningsQuarter = Math.floor(earningsDate.getMonth() / 3) + 1;
+              const earningsYear = earningsDate.getFullYear();
+              
+              nextQuarterData = {
+                date: nextEarnings.date,
+                symbol: symbolToUse,
+                fiscalPeriod: `Q${earningsQuarter} '${earningsYear.toString().slice(2)}`,
+                estimatedEps: nextEarnings.epsEstimated,
+                actualEps: null, // Not reported yet
+                surprisePercentage: null,
+                estimatedRevenue: null, // Often not provided
+                actualRevenue: null, // Not reported yet
+                isUpcoming: true
+              };
+            }
+          }
+        }
+        
+        // If we didn't find upcoming earnings, try analyst estimates
+        if (!nextQuarterData) {
+          const estimatesUrl = `https://financialmodelingprep.com/api/v3/analyst-estimates/${symbolToUse}?apikey=${apiKey}`;
+          const estimatesResponse = await fetch(estimatesUrl);
+          
+          if (estimatesResponse.ok) {
+            const estimatesData = await estimatesResponse.json();
+            if (Array.isArray(estimatesData) && estimatesData.length > 0) {
+              // Create a stub for the next quarter
+              const expectedReportDate = new Date(lastDate);
+              expectedReportDate.setMonth(expectedReportDate.getMonth() + 3);
+              
+              nextQuarterData = {
+                date: expectedReportDate.toISOString().split('T')[0],
+                symbol: symbolToUse,
+                fiscalPeriod: nextFiscalPeriod,
+                estimatedEps: null,
+                actualEps: null,
+                surprisePercentage: null,
+                estimatedRevenue: null,
+                actualRevenue: null,
+                isUpcoming: true
+              };
+              
+              // Try to find matching estimates from the response
+              for (const estimate of estimatesData) {
+                if (estimate.period === `Q${nextQuarter}` && estimate.year === nextYear) {
+                  nextQuarterData.estimatedEps = estimate.epsAvg || estimate.epsEstimated;
+                  nextQuarterData.estimatedRevenue = estimate.revenueAvg || estimate.estimatedRevenue;
+                  break;
+                }
+              }
+              
+              // If we didn't find a specific match, use the first estimate as fallback
+              if (nextQuarterData.estimatedEps === null && estimatesData[0]) {
+                nextQuarterData.estimatedEps = estimatesData[0].epsAvg;
+                nextQuarterData.estimatedRevenue = estimatesData[0].revenueAvg;
+              }
+            }
+          }
+        }
+        
+        // If we still don't have estimates, create a stub with the next fiscal period
+        if (!nextQuarterData) {
+          const expectedReportDate = new Date(lastDate);
+          expectedReportDate.setMonth(expectedReportDate.getMonth() + 3);
+          
+          nextQuarterData = {
+            date: expectedReportDate.toISOString().split('T')[0],
+            symbol: symbolToUse,
+            fiscalPeriod: nextFiscalPeriod,
+            estimatedEps: null,
+            actualEps: null,
+            surprisePercentage: null,
+            estimatedRevenue: null,
+            actualRevenue: null,
+            isUpcoming: true
+          };
+        }
+      } catch (error) {
+        console.error('Error fetching next quarter estimates:', error);
+        // Continue without next quarter data
+      }
+    }
+    
+    // Take only the most recent 3 reports for historical data
     const recentData = filteredData.slice(0, 3);
     
-    // Map to a consistent format
+    // Format the data consistently
     const formattedHistorical = recentData.map(item => {
       const date = new Date(item.date);
-      const quarter = Math.floor((date.getMonth() + 3) / 3);
+      const quarter = Math.floor((date.getMonth()) / 3) + 1;
       const year = date.getFullYear().toString().slice(2);
       
       return {
@@ -240,12 +292,12 @@ exports.handler = async function(event, context) {
       };
     });
     
-    // Add next quarter data if available
+    // Combine the data, with next quarter first if we have it
     const finalData = nextQuarterData 
-      ? [nextQuarterData, ...formattedHistorical]  // Put next quarter first
+      ? [nextQuarterData, ...formattedHistorical]
       : formattedHistorical;
     
-    // Add the symbol to the response in case it was detected from path/referer
+    // Return the results
     const responseData = {
       symbol: symbolToUse,
       period: period,
