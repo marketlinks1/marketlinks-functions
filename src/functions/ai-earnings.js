@@ -1,4 +1,4 @@
-// ai-earnings.js - Using the correct historical earnings calendar endpoint
+// ai-earnings.js - Using historical earnings calendar endpoint with styling improvements
 const fetch = require('node-fetch');
 
 exports.handler = async function(event, context) {
@@ -41,7 +41,6 @@ exports.handler = async function(event, context) {
   
   // If we still don't have a symbol, return an error
   if (!symbolToUse) {
-    console.log('No symbol provided in request');
     return {
       statusCode: 400,
       body: JSON.stringify({ 
@@ -53,10 +52,44 @@ exports.handler = async function(event, context) {
   console.log(`Processing earnings request for symbol: ${symbolToUse}, period: ${period}`);
   
   try {
-    // Use the historical earnings calendar endpoint - this should have data for most stocks
-    const calendarUrl = `https://financialmodelingprep.com/api/v3/historical/earning_calendar/${symbolToUse}?apikey=${apiKey}`;
+    // First, check for upcoming earnings
+    const upcomingUrl = `https://financialmodelingprep.com/api/v3/earning_calendar?symbol=${symbolToUse}&apikey=${apiKey}`;
+    let upcomingEarnings = null;
     
-    console.log(`Calling FMP API: ${calendarUrl.replace(apiKey, 'REDACTED')}`);
+    try {
+      const upcomingResponse = await fetch(upcomingUrl);
+      if (upcomingResponse.ok) {
+        const upcomingData = await upcomingResponse.json();
+        // Filter for future dates
+        const now = new Date();
+        const futureEarnings = upcomingData.filter(item => new Date(item.date) > now);
+        
+        if (futureEarnings.length > 0) {
+          // Sort by date and take the next upcoming one
+          futureEarnings.sort((a, b) => new Date(a.date) - new Date(b.date));
+          upcomingEarnings = futureEarnings[0];
+          
+          // Format the upcoming earnings data
+          upcomingEarnings = {
+            date: upcomingEarnings.date,
+            symbol: symbolToUse,
+            fiscalPeriod: `Q${upcomingEarnings.quarter} '${new Date(upcomingEarnings.date).getFullYear().toString().slice(2)}`,
+            estimatedEps: upcomingEarnings.epsEstimated,
+            actualEps: null, // Not reported yet
+            surprisePercentage: null,
+            estimatedRevenue: null, // Often not provided
+            actualRevenue: null, // Not reported yet
+            isUpcoming: true
+          };
+        }
+      }
+    } catch (error) {
+      console.error('Error fetching upcoming earnings:', error);
+      // Continue without upcoming data
+    }
+    
+    // Use the historical earnings calendar endpoint
+    const calendarUrl = `https://financialmodelingprep.com/api/v3/historical/earning_calendar/${symbolToUse}?apikey=${apiKey}`;
     
     const calendarResponse = await fetch(calendarUrl);
     
@@ -72,8 +105,6 @@ exports.handler = async function(event, context) {
     }
     
     let calendarData = await calendarResponse.json();
-    
-    console.log(`FMP API response received. Data type: ${typeof calendarData}, isArray: ${Array.isArray(calendarData)}, length: ${Array.isArray(calendarData) ? calendarData.length : 'N/A'}`);
     
     if (!Array.isArray(calendarData) || calendarData.length === 0) {
       console.log(`No data returned from historical earnings calendar API for symbol ${symbolToUse}`);
@@ -101,7 +132,7 @@ exports.handler = async function(event, context) {
       // If still no data, try income statement as a last resort
       if (!calendarData || calendarData.length === 0) {
         console.log('Trying fallback to income statement endpoint');
-        const incomeUrl = `https://financialmodelingprep.com/api/v3/income-statement/${symbolToUse}?period=${period === 'annual' ? 'annual' : 'quarter'}&limit=5&apikey=${apiKey}`;
+        const incomeUrl = `https://financialmodelingprep.com/api/v3/income-statement/${symbolToUse}?period=${period === 'annual' ? 'annual' : 'quarter'}&limit=4&apikey=${apiKey}`;
         const incomeResponse = await fetch(incomeUrl);
         
         if (incomeResponse.ok) {
@@ -150,8 +181,8 @@ exports.handler = async function(event, context) {
     // Sort by date, newest first
     filteredData.sort((a, b) => new Date(b.date) - new Date(a.date));
     
-    // Take only the most recent 5 reports
-    const recentData = filteredData.slice(0, 5);
+    // Take only the most recent 3 reports
+    const recentData = filteredData.slice(0, 3);
     
     // Map to a consistent format
     const formattedData = recentData.map(item => {
@@ -169,19 +200,23 @@ exports.handler = async function(event, context) {
         actualEps: item.eps,
         surprisePercentage: item.surprisePercentage,
         estimatedRevenue: item.revenueEstimated,
-        actualRevenue: item.revenue
+        actualRevenue: item.revenue,
+        isUpcoming: false
       };
     });
+    
+    // Add upcoming earnings if available
+    const finalData = upcomingEarnings 
+      ? [upcomingEarnings, ...formattedData]  // Put upcoming first
+      : formattedData;
     
     // Add the symbol to the response in case it was detected from path/referer
     const responseData = {
       symbol: symbolToUse,
       period: period,
       source: 'historical_earning_calendar',
-      earnings: formattedData
+      earnings: finalData
     };
-    
-    console.log(`Returning success response with ${responseData.earnings.length} earnings records`);
     
     return {
       statusCode: 200,
