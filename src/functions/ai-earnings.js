@@ -1,15 +1,7 @@
-// ai-earnings.js - Debug version with detailed logging
+// ai-earnings.js - Using the correct historical earnings calendar endpoint
 const fetch = require('node-fetch');
 
 exports.handler = async function(event, context) {
-  // Enable for detailed request logging
-  console.log('Request details:', {
-    path: event.path,
-    queryParams: event.queryStringParameters,
-    headers: event.headers,
-    method: event.httpMethod
-  });
-  
   // Extract API key from environment variables
   const apiKey = process.env.FMP_API_KEY;
   
@@ -61,76 +53,132 @@ exports.handler = async function(event, context) {
   console.log(`Processing earnings request for symbol: ${symbolToUse}, period: ${period}`);
   
   try {
-    let url;
+    // Use the historical earnings calendar endpoint - this should have data for most stocks
+    const calendarUrl = `https://financialmodelingprep.com/api/v3/historical/earning_calendar/${symbolToUse}?apikey=${apiKey}`;
     
-    // For quarterly earnings data (includes estimates and actuals)
-    if (period === 'quarterly') {
-      url = `https://financialmodelingprep.com/api/v3/earnings-surprises/${symbolToUse}?apikey=${apiKey}`;
-    } else {
-      // For annual data
-      url = `https://financialmodelingprep.com/api/v3/income-statement/${symbolToUse}?period=annual&limit=5&apikey=${apiKey}`;
-    }
+    console.log(`Calling FMP API: ${calendarUrl.replace(apiKey, 'REDACTED')}`);
     
-    console.log(`Calling FMP API: ${url.replace(apiKey, 'REDACTED')}`);
+    const calendarResponse = await fetch(calendarUrl);
     
-    const response = await fetch(url);
-    
-    if (!response.ok) {
-      console.error(`API request failed with status ${response.status}: ${response.statusText}`);
+    if (!calendarResponse.ok) {
+      console.error(`Historical earnings calendar API request failed with status ${calendarResponse.status}`);
       return {
-        statusCode: response.status,
+        statusCode: calendarResponse.status,
         body: JSON.stringify({ 
-          error: `Financial API returned an error: ${response.status} ${response.statusText}` 
-        })
-      };
-    }
-    
-    let data = await response.json();
-    
-    console.log(`FMP API response received. Data type: ${typeof data}, isArray: ${Array.isArray(data)}, length: ${Array.isArray(data) ? data.length : 'N/A'}`);
-    
-    if (Array.isArray(data) && data.length === 0) {
-      console.log(`No data returned from FMP API for symbol ${symbolToUse}`);
-      return {
-        statusCode: 404,
-        body: JSON.stringify({ 
-          error: `No earnings data found for symbol: ${symbolToUse}`,
+          error: `Financial API returned an error: ${calendarResponse.status}`,
           symbol: symbolToUse 
         })
       };
     }
     
-    // Transform annual data to match the format of quarterly data
-    if (period === 'annual' && Array.isArray(data)) {
-      console.log('Transforming annual data format');
-      data = data.map(item => {
-        // Calculate a synthetic "surprise" based on YoY growth
-        const prevYearIndex = data.findIndex(d => 
-          new Date(d.date).getFullYear() === new Date(item.date).getFullYear() - 1
-        );
+    let calendarData = await calendarResponse.json();
+    
+    console.log(`FMP API response received. Data type: ${typeof calendarData}, isArray: ${Array.isArray(calendarData)}, length: ${Array.isArray(calendarData) ? calendarData.length : 'N/A'}`);
+    
+    if (!Array.isArray(calendarData) || calendarData.length === 0) {
+      console.log(`No data returned from historical earnings calendar API for symbol ${symbolToUse}`);
+      
+      // Try fallback to earnings-surprises endpoint
+      console.log('Trying fallback to earnings-surprises endpoint');
+      const fallbackUrl = `https://financialmodelingprep.com/api/v3/earnings-surprises/${symbolToUse}?apikey=${apiKey}`;
+      const fallbackResponse = await fetch(fallbackUrl);
+      
+      if (fallbackResponse.ok) {
+        const fallbackData = await fallbackResponse.json();
+        if (Array.isArray(fallbackData) && fallbackData.length > 0) {
+          calendarData = fallbackData.map(item => ({
+            date: item.date,
+            symbol: symbolToUse,
+            eps: item.actualEps,
+            epsEstimated: item.estimatedEps,
+            revenue: item.actualRevenue || null,
+            revenueEstimated: item.estimatedRevenue || null,
+            surprisePercentage: item.surprisePercentage
+          }));
+        }
+      }
+      
+      // If still no data, try income statement as a last resort
+      if (!calendarData || calendarData.length === 0) {
+        console.log('Trying fallback to income statement endpoint');
+        const incomeUrl = `https://financialmodelingprep.com/api/v3/income-statement/${symbolToUse}?period=${period === 'annual' ? 'annual' : 'quarter'}&limit=5&apikey=${apiKey}`;
+        const incomeResponse = await fetch(incomeUrl);
         
-        const prevYearEps = prevYearIndex >= 0 ? data[prevYearIndex].eps : null;
-        const surprisePercentage = prevYearEps 
-          ? ((item.eps - prevYearEps) / Math.abs(prevYearEps)) * 100 
-          : null;
-        
-        return {
-          date: item.date,
-          fiscalPeriod: 'FY ' + new Date(item.date).getFullYear(),
-          estimatedEps: null, // No estimates in annual reports
-          actualEps: item.eps,
-          surprisePercentage: surprisePercentage,
-          estimatedRevenue: null,
-          actualRevenue: item.revenue
-        };
-      });
+        if (incomeResponse.ok) {
+          const incomeData = await incomeResponse.json();
+          if (Array.isArray(incomeData) && incomeData.length > 0) {
+            calendarData = incomeData.map(item => ({
+              date: item.date,
+              symbol: symbolToUse,
+              eps: item.eps,
+              epsEstimated: null,
+              revenue: item.revenue,
+              revenueEstimated: null,
+              surprisePercentage: null
+            }));
+          }
+        }
+      }
     }
+    
+    // If we still have no data after all fallbacks
+    if (!calendarData || calendarData.length === 0) {
+      return {
+        statusCode: 404,
+        body: JSON.stringify({ 
+          error: `No earnings data found for symbol: ${symbolToUse}`,
+          symbol: symbolToUse,
+          noData: true
+        })
+      };
+    }
+    
+    // Filter by period if requested
+    let filteredData = calendarData;
+    if (period === 'annual') {
+      // For annual, group by year and take the last report of each year
+      const yearGroups = {};
+      calendarData.forEach(item => {
+        const year = new Date(item.date).getFullYear();
+        if (!yearGroups[year] || new Date(item.date) > new Date(yearGroups[year].date)) {
+          yearGroups[year] = item;
+        }
+      });
+      filteredData = Object.values(yearGroups);
+    }
+    
+    // Sort by date, newest first
+    filteredData.sort((a, b) => new Date(b.date) - new Date(a.date));
+    
+    // Take only the most recent 5 reports
+    const recentData = filteredData.slice(0, 5);
+    
+    // Map to a consistent format
+    const formattedData = recentData.map(item => {
+      const date = new Date(item.date);
+      const quarter = Math.floor((date.getMonth() + 3) / 3);
+      const year = date.getFullYear().toString().slice(2);
+      
+      return {
+        date: item.date,
+        symbol: symbolToUse,
+        fiscalPeriod: period === 'annual' 
+          ? `FY ${date.getFullYear()}` 
+          : `Q${quarter} '${year}`,
+        estimatedEps: item.epsEstimated,
+        actualEps: item.eps,
+        surprisePercentage: item.surprisePercentage,
+        estimatedRevenue: item.revenueEstimated,
+        actualRevenue: item.revenue
+      };
+    });
     
     // Add the symbol to the response in case it was detected from path/referer
     const responseData = {
       symbol: symbolToUse,
       period: period,
-      earnings: Array.isArray(data) ? data : []
+      source: 'historical_earning_calendar',
+      earnings: formattedData
     };
     
     console.log(`Returning success response with ${responseData.earnings.length} earnings records`);
