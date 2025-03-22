@@ -1,4 +1,4 @@
-// stock-data.js - Place this in your Netlify functions directory
+// ai-earnings.js - Place this in your Netlify functions directory
 const fetch = require('node-fetch');
 
 exports.handler = async function(event, context) {
@@ -6,17 +6,17 @@ exports.handler = async function(event, context) {
   const apiKey = process.env.FMP_API_KEY;
   
   // Get query parameters
-  const { ticker, period = 'quarterly' } = event.queryStringParameters || {};
+  const { symbol, period = 'quarterly' } = event.queryStringParameters || {};
   
-  // If no ticker provided, check if we have a symbol in the URL path
-  let symbolToUse = ticker;
+  // If no symbol provided, check if we have a symbol in the URL path
+  let symbolToUse = symbol;
   
   if (!symbolToUse) {
-    // Extract symbol from the URL path if present (e.g., /stock-data/AAPL)
+    // Extract symbol from the URL path if present (e.g., /ai-earnings/AAPL)
     const pathParts = event.path.split('/');
     const pathSymbol = pathParts[pathParts.length - 1];
     
-    if (pathSymbol && pathSymbol.length > 0 && pathSymbol !== 'stock-data') {
+    if (pathSymbol && pathSymbol.length > 0 && pathSymbol !== 'ai-earnings') {
       symbolToUse = pathSymbol.toUpperCase();
     }
   }
@@ -32,7 +32,7 @@ exports.handler = async function(event, context) {
     return {
       statusCode: 400,
       body: JSON.stringify({ 
-        error: "Ticker symbol is required. Please specify in URL parameters or path." 
+        error: "Symbol parameter is required. Please specify in URL parameters or path." 
       })
     };
   }
@@ -48,7 +48,7 @@ exports.handler = async function(event, context) {
       url = `https://financialmodelingprep.com/api/v3/income-statement/${symbolToUse}?period=annual&limit=5&apikey=${apiKey}`;
     }
     
-    console.log(`Fetching data for ${symbolToUse} (${period})`);
+    console.log(`Fetching earnings data for ${symbolToUse} (${period})`);
     
     const response = await fetch(url);
     
@@ -73,7 +73,7 @@ exports.handler = async function(event, context) {
         
         return {
           date: item.date,
-          period: 'FY ' + new Date(item.date).getFullYear(),
+          fiscalPeriod: 'FY ' + new Date(item.date).getFullYear(),
           estimatedEps: null, // No estimates in annual reports
           actualEps: item.eps,
           surprisePercentage: surprisePercentage,
@@ -93,7 +93,7 @@ exports.handler = async function(event, context) {
       body: JSON.stringify(data)
     };
   } catch (error) {
-    console.error('Error fetching stock data:', error);
+    console.error('Error fetching earnings data:', error);
     
     return {
       statusCode: 500,
