@@ -1,9 +1,25 @@
-// ai-earnings.js - Place this in your Netlify functions directory
+// ai-earnings.js - Debug version with detailed logging
 const fetch = require('node-fetch');
 
 exports.handler = async function(event, context) {
+  // Enable for detailed request logging
+  console.log('Request details:', {
+    path: event.path,
+    queryParams: event.queryStringParameters,
+    headers: event.headers,
+    method: event.httpMethod
+  });
+  
   // Extract API key from environment variables
   const apiKey = process.env.FMP_API_KEY;
+  
+  if (!apiKey) {
+    console.error('FMP_API_KEY environment variable is not set');
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: "API key is not configured" })
+    };
+  }
   
   // Get query parameters
   const { symbol, period = 'quarterly' } = event.queryStringParameters || {};
@@ -23,12 +39,17 @@ exports.handler = async function(event, context) {
   
   // If still no symbol, use URL referer to extract symbol if present
   if (!symbolToUse && event.headers.referer) {
-    const urlParams = new URL(event.headers.referer).searchParams;
-    symbolToUse = urlParams.get('symbol') || urlParams.get('ticker');
+    try {
+      const urlParams = new URL(event.headers.referer).searchParams;
+      symbolToUse = urlParams.get('symbol') || urlParams.get('ticker');
+    } catch (error) {
+      console.error('Error parsing referer URL:', error);
+    }
   }
   
   // If we still don't have a symbol, return an error
   if (!symbolToUse) {
+    console.log('No symbol provided in request');
     return {
       statusCode: 400,
       body: JSON.stringify({ 
@@ -36,6 +57,8 @@ exports.handler = async function(event, context) {
       })
     };
   }
+  
+  console.log(`Processing earnings request for symbol: ${symbolToUse}, period: ${period}`);
   
   try {
     let url;
@@ -48,18 +71,38 @@ exports.handler = async function(event, context) {
       url = `https://financialmodelingprep.com/api/v3/income-statement/${symbolToUse}?period=annual&limit=5&apikey=${apiKey}`;
     }
     
-    console.log(`Fetching earnings data for ${symbolToUse} (${period})`);
+    console.log(`Calling FMP API: ${url.replace(apiKey, 'REDACTED')}`);
     
     const response = await fetch(url);
     
     if (!response.ok) {
-      throw new Error(`API request failed with status ${response.status}`);
+      console.error(`API request failed with status ${response.status}: ${response.statusText}`);
+      return {
+        statusCode: response.status,
+        body: JSON.stringify({ 
+          error: `Financial API returned an error: ${response.status} ${response.statusText}` 
+        })
+      };
     }
     
     let data = await response.json();
     
+    console.log(`FMP API response received. Data type: ${typeof data}, isArray: ${Array.isArray(data)}, length: ${Array.isArray(data) ? data.length : 'N/A'}`);
+    
+    if (Array.isArray(data) && data.length === 0) {
+      console.log(`No data returned from FMP API for symbol ${symbolToUse}`);
+      return {
+        statusCode: 404,
+        body: JSON.stringify({ 
+          error: `No earnings data found for symbol: ${symbolToUse}`,
+          symbol: symbolToUse 
+        })
+      };
+    }
+    
     // Transform annual data to match the format of quarterly data
     if (period === 'annual' && Array.isArray(data)) {
+      console.log('Transforming annual data format');
       data = data.map(item => {
         // Calculate a synthetic "surprise" based on YoY growth
         const prevYearIndex = data.findIndex(d => 
@@ -83,6 +126,15 @@ exports.handler = async function(event, context) {
       });
     }
     
+    // Add the symbol to the response in case it was detected from path/referer
+    const responseData = {
+      symbol: symbolToUse,
+      period: period,
+      earnings: Array.isArray(data) ? data : []
+    };
+    
+    console.log(`Returning success response with ${responseData.earnings.length} earnings records`);
+    
     return {
       statusCode: 200,
       headers: {
@@ -90,14 +142,17 @@ exports.handler = async function(event, context) {
         'Access-Control-Allow-Origin': '*',
         'Cache-Control': 'public, max-age=3600' // Cache for 1 hour
       },
-      body: JSON.stringify(data)
+      body: JSON.stringify(responseData)
     };
   } catch (error) {
-    console.error('Error fetching earnings data:', error);
+    console.error('Error processing earnings request:', error);
     
     return {
       statusCode: 500,
-      body: JSON.stringify({ error: error.message })
+      body: JSON.stringify({ 
+        error: `Internal server error: ${error.message}`,
+        symbol: symbolToUse
+      })
     };
   }
 };
