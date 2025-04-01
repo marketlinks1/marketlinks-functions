@@ -2,7 +2,7 @@
 const axios = require('axios');
 
 exports.handler = async function(event, context) {
-  // For OPTIONS requests (CORS preflight)
+  // Handle CORS preflight requests
   if (event.httpMethod === 'OPTIONS') {
     return {
       statusCode: 200,
@@ -19,12 +19,21 @@ exports.handler = async function(event, context) {
     // Get the FMP API key from environment variables
     const apiKey = process.env.FMP_API_KEY;
     
-    // Get the endpoint path and parameters from the request
-    let endpoint, symbol;
+    if (!apiKey) {
+      return {
+        statusCode: 500,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ error: "API key is not configured" })
+      };
+    }
+    
+    // Parse the request body
+    let params = {};
     try {
-      const body = JSON.parse(event.body);
-      endpoint = body.endpoint;
-      symbol = body.symbol;
+      params = JSON.parse(event.body);
     } catch (e) {
       return {
         statusCode: 400,
@@ -36,7 +45,9 @@ exports.handler = async function(event, context) {
       };
     }
     
-    // Check if endpoint is provided
+    // Extract required parameters
+    const { endpoint } = params;
+    
     if (!endpoint) {
       return {
         statusCode: 400,
@@ -48,23 +59,27 @@ exports.handler = async function(event, context) {
       };
     }
     
-    // Construct URL based on the correct format for the endpoint
-    let url;
+    // Remove apikey from params if it's present (we'll add our own)
+    const { apikey, ...queryParams } = params;
     
-    if (endpoint === 'profile' && symbol) {
-      // Special case for profile endpoint which uses query parameter
-      url = `https://financialmodelingprep.com/stable/profile?symbol=${symbol}&apikey=${apiKey}`;
+    // Construct the URL
+    let url = `https://financialmodelingprep.com/stable/${endpoint}`;
+    
+    // Add query parameters
+    const queryString = Object.entries(queryParams)
+      .filter(([key]) => key !== 'endpoint')
+      .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+      .join('&');
+    
+    // Add the query string and API key
+    if (queryString) {
+      url = `${url}?${queryString}&apikey=${apiKey}`;
     } else {
-      // Default case for other endpoints
-      url = `https://financialmodelingprep.com/stable/${endpoint}?apikey=${apiKey}`;
-      
-      // If symbol is provided, add it to the URL
-      if (symbol) {
-        url = url.replace('?', `?symbol=${symbol}&`);
-      }
+      url = `${url}?apikey=${apiKey}`;
     }
     
-    console.log(`Making request to: ${url}`); // For debugging
+    // Log the URL being requested (useful for debugging)
+    console.log(`Making request to: ${url}`);
     
     // Make the request to FMP
     const response = await axios.get(url);
@@ -81,14 +96,15 @@ exports.handler = async function(event, context) {
     console.error('Error:', error);
     
     return {
-      statusCode: 500,
+      statusCode: error.response?.status || 500,
       headers: {
         "Access-Control-Allow-Origin": "*",
         "Content-Type": "application/json"
       },
       body: JSON.stringify({ 
         error: "Failed to fetch data from FMP API",
-        details: error.message
+        details: error.message,
+        response: error.response?.data
       })
     };
   }
