@@ -7,7 +7,7 @@ exports.handler = async function(event, context) {
     return {
       statusCode: 200,
       headers: {
-        "Access-Control-Allow-Origin": "https://www.themarketlinks.com", // Or specify "https://www.themarketlinks.com"
+        "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Headers": "Content-Type",
         "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
       },
@@ -19,16 +19,17 @@ exports.handler = async function(event, context) {
     // Get the FMP API key from environment variables
     const apiKey = process.env.FMP_API_KEY;
     
-    // Get the endpoint path from the request
-    let endpoint;
+    // Get the endpoint path and parameters from the request
+    let endpoint, symbol;
     try {
       const body = JSON.parse(event.body);
       endpoint = body.endpoint;
+      symbol = body.symbol;
     } catch (e) {
       return {
         statusCode: 400,
         headers: {
-          "Access-Control-Allow-Origin": "https://www.themarketlinks.com", // Or specify "https://www.themarketlinks.com"
+          "Access-Control-Allow-Origin": "*",
           "Content-Type": "application/json"
         },
         body: JSON.stringify({ error: "Invalid request body" })
@@ -40,16 +41,30 @@ exports.handler = async function(event, context) {
       return {
         statusCode: 400,
         headers: {
-          "Access-Control-Allow-Origin": "*", // Or specify "https://www.themarketlinks.com"
+          "Access-Control-Allow-Origin": "*",
           "Content-Type": "application/json"
         },
         body: JSON.stringify({ error: "Endpoint parameter is required" })
       };
     }
     
-    // Add API key to the URL correctly
-    const separator = endpoint.includes('?') ? '&' : '?';
-    const url = `https://financialmodelingprep.com/stable/${endpoint}${separator}apikey=${apiKey}`;
+    // Construct URL based on the correct format for the endpoint
+    let url;
+    
+    if (endpoint === 'profile' && symbol) {
+      // Special case for profile endpoint which uses query parameter
+      url = `https://financialmodelingprep.com/stable/profile?symbol=${symbol}&apikey=${apiKey}`;
+    } else {
+      // Default case for other endpoints
+      url = `https://financialmodelingprep.com/stable/${endpoint}?apikey=${apiKey}`;
+      
+      // If symbol is provided, add it to the URL
+      if (symbol) {
+        url = url.replace('?', `?symbol=${symbol}&`);
+      }
+    }
+    
+    console.log(`Making request to: ${url}`); // For debugging
     
     // Make the request to FMP
     const response = await axios.get(url);
@@ -57,7 +72,7 @@ exports.handler = async function(event, context) {
     return {
       statusCode: 200,
       headers: {
-        "Access-Control-Allow-Origin": "*", // Or specify "https://www.themarketlinks.com"
+        "Access-Control-Allow-Origin": "*",
         "Content-Type": "application/json"
       },
       body: JSON.stringify(response.data)
@@ -68,7 +83,7 @@ exports.handler = async function(event, context) {
     return {
       statusCode: 500,
       headers: {
-        "Access-Control-Allow-Origin": "https://www.themarketlinks.com", // Or specify "https://www.themarketlinks.com"
+        "Access-Control-Allow-Origin": "*",
         "Content-Type": "application/json"
       },
       body: JSON.stringify({ 
