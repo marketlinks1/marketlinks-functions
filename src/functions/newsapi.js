@@ -1,6 +1,6 @@
 // netlify/functions/benzinga-news.js
 
-const axios = require('axios');
+const axios = require('axios'); 
 
 exports.handler = async function(event, context) {
   // CORS headers to allow your Webflow site to access this function
