@@ -1,4 +1,4 @@
-// netlify/functions/benzinga-bull-bear.js
+// functions/benzinga-news.js
 
 const https = require('https');
 
@@ -26,20 +26,16 @@ exports.handler = async function(event, context) {
   // Your Benzinga API key (best stored as an environment variable)
   const API_KEY = process.env.BENZINGA_API_KEY || '5530b66d78d244cb9d9517a9442c199d';
 
-  if (!ticker) {
-    return {
-      statusCode: 400,
-      headers,
-      body: JSON.stringify({ error: 'Ticker symbol is required' })
-    };
-  }
-
   try {
-    // Construct the API URL for bull/bear cases
-    const queryString = `token=${API_KEY}&symbols=${ticker}`;
+    // Construct the API URL with query parameters
+    let queryString = `token=${API_KEY}&pageSize=${params.pageSize || '10'}&displayOutput=full`;
     
-    // Make the API request using native https module
-    const data = await makeRequest('api.benzinga.com', `/api/v1/bulls_bears_say?${queryString}`);
+    if (ticker) {
+      queryString += `&tickers=${ticker}`;
+    }
+    
+    // Make the API request using native https module (no external dependencies)
+    const data = await makeRequest('api.benzinga.com', `/api/v2/news?${queryString}`);
     
     return {
       statusCode: 200,
@@ -47,13 +43,13 @@ exports.handler = async function(event, context) {
       body: data
     };
   } catch (error) {
-    console.error('Error fetching bull/bear data:', error);
+    console.error('Error fetching Benzinga news:', error);
     
     return {
       statusCode: 500,
       headers,
       body: JSON.stringify({ 
-        error: 'Failed to fetch bull/bear data', 
+        error: 'Failed to fetch news data', 
         details: error.message 
       })
     };
